@@ -14,12 +14,7 @@ from safetensors import safe_open
 
 from .parallel_states import ParallelStates
 from .safetensor_io import SafeTensorIO
-from .util import (
-    broadcast_from_megatron_pp,
-    broadcast_str_from_megatron_pp,
-    get_model,
-    unwrap_model,
-)
+from .util import get_model, unwrap_model
 
 
 class Bridge(ABC):
@@ -539,15 +534,150 @@ class Bridge(ABC):
         self.extra_args.update(kwargs)
         self.config = self._build_config()
 
+    def _is_export_stage_sender_candidate(self) -> bool:
+        return (
+            self.mpu.tp_rank == 0
+            and self.mpu.ep_rank == 0
+            and self.mpu.etp_rank == 0
+            and self.mpu.cp_rank == 0
+        )
+
+    def _get_export_stage_sender_ranks(self) -> dict[int, int]:
+        is_distributed = (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        )
+        if not is_distributed:
+            return {0: 0}
+
+        world_size = torch.distributed.get_world_size()
+        global_rank = torch.distributed.get_rank()
+        sender_candidates = [None] * world_size
+        torch.distributed.all_gather_object(
+            sender_candidates,
+            (
+                global_rank,
+                self.mpu.pp_rank,
+                self._is_export_stage_sender_candidate(),
+            ),
+        )
+
+        sender_ranks = {}
+        for candidate_rank, pp_rank, is_candidate in sender_candidates:
+            if not is_candidate:
+                continue
+            if pp_rank not in sender_ranks or candidate_rank < sender_ranks[pp_rank]:
+                sender_ranks[pp_rank] = candidate_rank
+
+        assert len(sender_ranks) == self.mpu.pp_size, (
+            f"missing stage senders {sender_ranks=} {self.mpu.pp_size=}"
+        )
+        return sender_ranks
+
+    @staticmethod
+    def _torch_dtype_name(dtype: torch.dtype) -> str:
+        return str(dtype).split(".", maxsplit=1)[1]
+
+    @staticmethod
+    def _torch_dtype_from_name(dtype_name: str) -> torch.dtype:
+        return getattr(torch, dtype_name)
+
+    def _send_export_tensor(
+        self, dst_rank: int, hf_name: str, tensor: torch.Tensor
+    ) -> None:
+        torch.distributed.send_object_list(
+            [("tensor", hf_name, tuple(tensor.shape), self._torch_dtype_name(tensor.dtype))],
+            dst=dst_rank,
+        )
+        torch.distributed.send(tensor=tensor.contiguous(), dst=dst_rank)
+
+    def _send_export_stage_end(self, dst_rank: int) -> None:
+        torch.distributed.send_object_list(
+            [("stage_end", None, None, None)],
+            dst=dst_rank,
+        )
+
+    def _recv_export_stage_tensors(
+        self, src_rank: int
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        while True:
+            header = [None]
+            torch.distributed.recv_object_list(header, src=src_rank)
+            kind, hf_name, shape, dtype_name = header[0]
+            if kind == "stage_end":
+                return
+
+            tensor = torch.empty(
+                shape,
+                dtype=self._torch_dtype_from_name(dtype_name),
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.recv(tensor=tensor, src=src_rank)
+            yield hf_name, tensor
+
+    def _gather_export_bucket_to_rank0(
+        self,
+        bucket: list[tuple[str, torch.Tensor]],
+        group: torch.distributed.ProcessGroup,
+        group_rank: int,
+        group_size: int,
+    ) -> list[tuple[str, torch.Tensor, list[torch.Tensor]]] | None:
+        if not bucket:
+            return []
+
+        if group_size <= 1:
+            if group_rank == 0:
+                return [(name, param, [param]) for name, param in bucket]
+            return None
+
+        flat_shards = [param.reshape(-1) for _, param in bucket]
+        flat_buffer = torch.cat(flat_shards).contiguous()
+        gather_list = (
+            [torch.empty_like(flat_buffer) for _ in range(group_size)]
+            if group_rank == 0
+            else None
+        )
+        torch.distributed.gather(
+            tensor=flat_buffer,
+            gather_list=gather_list,
+            group=group,
+            group_dst=0,
+        )
+        if group_rank != 0:
+            return None
+
+        split_sizes = [shard.numel() for shard in flat_shards]
+        gathered_splits = [buf.split(split_sizes) for buf in gather_list]
+        gathered_bucket = []
+        for idx, (name, param) in enumerate(bucket):
+            shards = [
+                gathered_splits[rank][idx].reshape(param.shape)
+                for rank in range(group_size)
+            ]
+            gathered_bucket.append((name, param, shards))
+        return gathered_bucket
+
     @torch.no_grad()
     def export_weights(
         self, models: list[torch.nn.Module],
-        tp_gather_bucket_size_bytes: int = 2 * 1024**3,
+        gather_bucket_size_bytes: int = 2 * 1024**3,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         assert (
             len(self.export_weights_buff) == 0
         ), f"should be empty {self.export_weights_buff=}"
         models = [unwrap_model(model) for model in models]
+        is_distributed = (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        )
+        global_rank = torch.distributed.get_rank() if is_distributed else 0
+        # we use rank0 as the exporter rank for now
+        exporter_rank = 0
+        stage_sender_ranks = self._get_export_stage_sender_ranks()
+        is_selected_stage_sender = stage_sender_ranks[self.mpu.pp_rank] == global_rank
+
+        if is_distributed and stage_sender_ranks.get(0) != exporter_rank:
+            raise RuntimeError(
+                "global rank 0 must be the selected sender for pipeline stage 0"
+            )
 
         def get_model_chunk_generator():
             for model in models:
@@ -575,7 +705,7 @@ class Bridge(ABC):
             existing_keys = set()
             for name, param in model.named_parameters():
                 existing_keys.add(name)
-                weights_names.append((self.mpu.pp_rank, vpp_rank, name))
+                weights_names.append((vpp_rank, name))
             extra_keys = [
                 x
                 for x in model.state_dict().keys()
@@ -584,13 +714,8 @@ class Bridge(ABC):
                 and x not in existing_keys
             ]
             for name in extra_keys:
-                weights_names.append((self.mpu.pp_rank, vpp_rank, name))
+                weights_names.append((vpp_rank, name))
 
-        weights_names_all_pp = [None] * self.mpu.pp_size
-        torch.distributed.all_gather_object(
-            object_list=weights_names_all_pp, obj=weights_names, group=self.mpu.pp_group
-        )
-        weights_names_all_pp = sum(weights_names_all_pp, [])
         model_chunk_generator = get_model_chunk_generator()
         local_to_global_maps = [
             self._weight_name_mapping_mcore_local_to_global(model, consider_ep=False)
@@ -598,144 +723,169 @@ class Bridge(ABC):
         ]
 
         tp_bucket: list[tuple[str, torch.Tensor]] = []
-        tp_bucket_bytes = [0]
+        tp_bucket_bytes = 0
+        ep_bucket: list[tuple[str, torch.Tensor]] = []
+        ep_bucket_bytes = 0
 
-        # only rank0 is the dst rank of gather and returns results
-        def _flush_tp_bucket() -> list[tuple[str, torch.Tensor]]:
-            if not tp_bucket:
-                return []
-            results = []
-            if self.mpu.tp_size <= 1:
-                for bname, bparam in tp_bucket:
-                    merged = self._weight_merge_across_tp(bname, [bparam], bparam)
-                    results.append((bname, merged))
-            else:
-                is_tp_rank0 = self.mpu.tp_rank == 0
-                flat_shards = [p.flatten() for _, p in tp_bucket]
-                flat_buffer = torch.cat(flat_shards)
-                gathered_flat = [
-                    torch.empty_like(flat_buffer) for _ in range(self.mpu.tp_size)
-                ] if is_tp_rank0 else None
-                torch.distributed.gather(
-                    flat_buffer, gathered_flat, group=self.mpu.tp_group, group_dst=0
-                )
-                if is_tp_rank0:
-                    split_sizes = [s.numel() for s in flat_shards]
-                    gathered_splits = [buf.split(split_sizes) for buf in gathered_flat]
-                    for i, (bname, bparam) in enumerate(tp_bucket):
-                        infer_params = [
-                            gathered_splits[tp_rank][i].reshape(bparam.shape)
-                            for tp_rank in range(self.mpu.tp_size)
-                        ]
-                        merged = self._weight_merge_across_tp(bname, infer_params, bparam)
-                        results.append((bname, merged))
-                else:
-                    results.append((None, None))
-            tp_bucket.clear()
-            tp_bucket_bytes[0] = 0
-            return results
+        def _tensor_num_bytes(tensor: torch.Tensor) -> int:
+            return tensor.nelement() * tensor.element_size()
 
-        def _yield_from_tp_bucket():
-            for bname, merged in _flush_tp_bucket():
-                if bname is None:
-                    return
+        def _should_flush_bucket(
+            bucket: list[tuple[str, torch.Tensor]],
+            bucket_bytes: int,
+            tensor: torch.Tensor,
+        ) -> bool:
+            if not bucket:
+                return False
+            return (
+                tensor.dtype != bucket[0][1].dtype
+                or bucket_bytes + _tensor_num_bytes(tensor) > gather_bucket_size_bytes
+            )
+
+        def _flush_tp_bucket():
+            nonlocal tp_bucket, tp_bucket_bytes
+            gathered_bucket = self._gather_export_bucket_to_rank0(
+                tp_bucket,
+                self.mpu.tp_group,
+                self.mpu.tp_rank,
+                self.mpu.tp_size,
+            )
+            tp_bucket = []
+            tp_bucket_bytes = 0
+            if gathered_bucket is None or not is_selected_stage_sender:
+                return
+
+            for bname, bparam, shards in gathered_bucket:
+                merged = self._weight_merge_across_tp(bname, shards, bparam)
                 converted_names, converted_params = self._weight_to_hf_format(
                     bname, merged
                 )
                 if len(converted_names) == 0:
                     continue
-                yield from zip(converted_names, [p.detach() for p in converted_params])
+                for out_name, out_param in zip(converted_names, converted_params):
+                    yield out_name, out_param.detach()
 
-        for iter_pp_rank, iter_vpp_rank, iter_name in weights_names_all_pp:
-            local_to_global_map = local_to_global_maps[iter_vpp_rank]
-            if iter_pp_rank == self.mpu.pp_rank:
-                try:
-                    name, param = next(model_chunk_generator)
-                except StopIteration:
-                    name, param = None, None
-                name = local_to_global_map[iter_name]
-            else:
-                name, param = None, None
+        def _flush_ep_bucket():
+            nonlocal ep_bucket, ep_bucket_bytes
+            gathered_ep_bucket = self._gather_export_bucket_to_rank0(
+                ep_bucket,
+                self.mpu.ep_group,
+                self.mpu.ep_rank,
+                self.mpu.ep_size,
+            )
+            ep_bucket = []
+            ep_bucket_bytes = 0
+            if gathered_ep_bucket is None:
+                return
 
-            name = broadcast_str_from_megatron_pp(name)
-            broad_pp_param = broadcast_from_megatron_pp(param)
-            param_bytes = broad_pp_param.nelement() * broad_pp_param.element_size()
-
-            # EP
-            if ".mlp.experts.linear_fc" in name and self.mpu.ep_size >= 1:
-                if tp_bucket and broad_pp_param.dtype != tp_bucket[0][1].dtype or param_bytes + tp_bucket_bytes[0] > tp_gather_bucket_size_bytes:
-                    yield from _yield_from_tp_bucket()
-                num_experts = self.config.num_moe_experts
-                num_experts_per_rank = num_experts // self.mpu.ep_size
-                infer_params = [
-                    torch.empty_like(broad_pp_param) for _ in range(self.mpu.ep_size)
-                ]
-                torch.distributed.all_gather(
-                    infer_params, broad_pp_param, group=self.mpu.ep_group
-                )
-
-                name_prefix, local_expert_id = name.split(".weight")
+            num_experts = self.config.num_moe_experts
+            num_experts_per_rank = num_experts // self.mpu.ep_size
+            etp_bucket: list[tuple[str, torch.Tensor]] = []
+            for bname, _, ep_shards in gathered_ep_bucket:
+                name_prefix, local_expert_id = bname.split(".weight")
                 local_expert_id = int(local_expert_id)
                 global_expert_ids = [
                     num_experts_per_rank * ep_rank + local_expert_id
                     for ep_rank in range(self.mpu.ep_size)
                 ]
-                global_expert_names = [
-                    f"{name_prefix}.weight{expert_id}"
-                    for expert_id in global_expert_ids
-                ]
-
-                for name, param in zip(global_expert_names, infer_params):
-                    if self.mpu.etp_size > 1:
-                        # gather etp
-                        etp_params = [
-                            torch.empty_like(param) for _ in range(self.mpu.etp_size)
-                        ]
-                        torch.distributed.all_gather(
-                            etp_params, param, group=self.mpu.etp_group
-                        )
-                        params = etp_params
-                    else:
-                        params = [param]
-
-                    merge_params = self._weight_merge_across_tp(
-                        name, params, broad_pp_param
+                for global_expert_id, expert_param in zip(global_expert_ids, ep_shards):
+                    etp_bucket.append(
+                        (f"{name_prefix}.weight{global_expert_id}", expert_param)
                     )
-                    converted_names, converted_params = self._weight_to_hf_format(
-                        name, merge_params
-                    )
-                    # Some moe models require multiple weights to be merge into one, such as qwen3vl
-                    if len(converted_names) == 0:
-                        continue
 
-                    yield from zip(converted_names, [p.detach() for p in converted_params])
-                continue
-
-            # TP: add to bucket for batched gather
-            if (
-                hasattr(broad_pp_param, "tensor_model_parallel")
-                and broad_pp_param.tensor_model_parallel
-            ):
-                if tp_bucket and broad_pp_param.dtype != tp_bucket[0][1].dtype or param_bytes + tp_bucket_bytes[0] > tp_gather_bucket_size_bytes:
-                    yield from _yield_from_tp_bucket()
-                tp_bucket.append((name, broad_pp_param))
-                tp_bucket_bytes[0] += param_bytes
-                continue
-
-            # Non-TP param: flush pending TP bucket first
-            yield from _yield_from_tp_bucket()
-
-            infer_params = broad_pp_param
-            converted_names, converted_params = self._weight_to_hf_format(
-                name, infer_params
+            gathered_etp_bucket = self._gather_export_bucket_to_rank0(
+                etp_bucket,
+                self.mpu.etp_group,
+                self.mpu.etp_rank,
+                self.mpu.etp_size,
             )
-            # Some moe models require multiple weights to be merge into one, such as qwen3vl
-            if len(converted_names) == 0:
-                continue
+            if gathered_etp_bucket is None or not is_selected_stage_sender:
+                return
 
-            yield from zip(converted_names, [p.detach() for p in converted_params])
+            for bname, bparam, shards in gathered_etp_bucket:
+                merged = self._weight_merge_across_tp(bname, shards, bparam)
+                converted_names, converted_params = self._weight_to_hf_format(
+                    bname, merged
+                )
+                if len(converted_names) == 0:
+                    continue
+                for out_name, out_param in zip(converted_names, converted_params):
+                    yield out_name, out_param.detach()
 
-        yield from _yield_from_tp_bucket()
+        def _iter_local_stage_outputs():
+            nonlocal tp_bucket_bytes, ep_bucket_bytes
+            for iter_vpp_rank, iter_name in weights_names:
+                local_to_global_map = local_to_global_maps[iter_vpp_rank]
+                try:
+                    _, param = next(model_chunk_generator)
+                except StopIteration:
+                    _, param = None, None
+                name = local_to_global_map[iter_name]
+                param_bytes = _tensor_num_bytes(param)
+                is_ep_param = ".mlp.experts.linear_fc" in name and self.mpu.ep_size >= 1
+                is_tp_param = (
+                    hasattr(param, "tensor_model_parallel")
+                    and param.tensor_model_parallel
+                )
+
+                if is_ep_param:
+                    yield from _flush_tp_bucket()
+                    if _should_flush_bucket(ep_bucket, ep_bucket_bytes, param):
+                        yield from _flush_ep_bucket()
+                    ep_bucket.append((name, param))
+                    ep_bucket_bytes += param_bytes
+                    # for very large params
+                    if ep_bucket_bytes >= gather_bucket_size_bytes:
+                        yield from _flush_ep_bucket()
+                    continue
+
+                yield from _flush_ep_bucket()
+
+                if is_tp_param:
+                    if _should_flush_bucket(tp_bucket, tp_bucket_bytes, param):
+                        yield from _flush_tp_bucket()
+                    tp_bucket.append((name, param))
+                    tp_bucket_bytes += param_bytes
+                    if tp_bucket_bytes >= gather_bucket_size_bytes:
+                        yield from _flush_tp_bucket()
+                    continue
+
+                yield from _flush_tp_bucket()
+
+                if not is_selected_stage_sender:
+                    continue
+
+                converted_names, converted_params = self._weight_to_hf_format(name, param)
+                if len(converted_names) == 0:
+                    continue
+                for out_name, out_param in zip(converted_names, converted_params):
+                    yield out_name, out_param.detach()
+
+            yield from _flush_ep_bucket()
+            yield from _flush_tp_bucket()
+
+        if not is_distributed:
+            yield from _iter_local_stage_outputs()
+            return
+
+        for target_pp_rank in range(self.mpu.pp_size):
+            if self.mpu.pp_rank == target_pp_rank:
+                for hf_name, tensor in _iter_local_stage_outputs():
+                    if is_selected_stage_sender:
+                        if global_rank == exporter_rank:
+                            yield hf_name, tensor
+                        else:
+                            self._send_export_tensor(exporter_rank, hf_name, tensor)
+                if is_selected_stage_sender and global_rank != exporter_rank:
+                    self._send_export_stage_end(exporter_rank)
+
+            if (
+                global_rank == exporter_rank
+                and stage_sender_ranks[target_pp_rank] != exporter_rank
+            ):
+                yield from self._recv_export_stage_tensors(
+                    stage_sender_ranks[target_pp_rank]
+                )
 
     def export_weights_without_gather(
         self, models: list[torch.nn.Module],
