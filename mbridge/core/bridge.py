@@ -542,6 +542,7 @@ class Bridge(ABC):
     @torch.no_grad()
     def export_weights(
         self, models: list[torch.nn.Module],
+        tp_gather_bucket_size_bytes: int = 2 * 1024**3,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         assert (
             len(self.export_weights_buff) == 0
@@ -595,6 +596,56 @@ class Bridge(ABC):
             self._weight_name_mapping_mcore_local_to_global(model, consider_ep=False)
             for model in models
         ]
+
+        tp_bucket: list[tuple[str, torch.Tensor]] = []
+        tp_bucket_bytes = [0]
+
+        # only rank0 is the dst rank of gather and returns results
+        def _flush_tp_bucket() -> list[tuple[str, torch.Tensor]]:
+            if not tp_bucket:
+                return []
+            results = []
+            if self.mpu.tp_size <= 1:
+                for bname, bparam in tp_bucket:
+                    merged = self._weight_merge_across_tp(bname, [bparam], bparam)
+                    results.append((bname, merged))
+            else:
+                is_tp_rank0 = self.mpu.tp_rank == 0
+                flat_shards = [p.flatten() for _, p in tp_bucket]
+                flat_buffer = torch.cat(flat_shards)
+                gathered_flat = [
+                    torch.empty_like(flat_buffer) for _ in range(self.mpu.tp_size)
+                ] if is_tp_rank0 else None
+                torch.distributed.gather(
+                    flat_buffer, gathered_flat, group=self.mpu.tp_group, group_dst=0
+                )
+                if is_tp_rank0:
+                    split_sizes = [s.numel() for s in flat_shards]
+                    gathered_splits = [buf.split(split_sizes) for buf in gathered_flat]
+                    for i, (bname, bparam) in enumerate(tp_bucket):
+                        infer_params = [
+                            gathered_splits[tp_rank][i].reshape(bparam.shape)
+                            for tp_rank in range(self.mpu.tp_size)
+                        ]
+                        merged = self._weight_merge_across_tp(bname, infer_params, bparam)
+                        results.append((bname, merged))
+                else:
+                    results.append((None, None))
+            tp_bucket.clear()
+            tp_bucket_bytes[0] = 0
+            return results
+
+        def _yield_from_tp_bucket():
+            for bname, merged in _flush_tp_bucket():
+                if bname is None:
+                    return
+                converted_names, converted_params = self._weight_to_hf_format(
+                    bname, merged
+                )
+                if len(converted_names) == 0:
+                    continue
+                yield from zip(converted_names, [p.detach() for p in converted_params])
+
         for iter_pp_rank, iter_vpp_rank, iter_name in weights_names_all_pp:
             local_to_global_map = local_to_global_maps[iter_vpp_rank]
             if iter_pp_rank == self.mpu.pp_rank:
@@ -608,9 +659,12 @@ class Bridge(ABC):
 
             name = broadcast_str_from_megatron_pp(name)
             broad_pp_param = broadcast_from_megatron_pp(param)
+            param_bytes = broad_pp_param.nelement() * broad_pp_param.element_size()
 
             # EP
             if ".mlp.experts.linear_fc" in name and self.mpu.ep_size >= 1:
+                if tp_bucket and broad_pp_param.dtype != tp_bucket[0][1].dtype or param_bytes + tp_bucket_bytes[0] > tp_gather_bucket_size_bytes:
+                    yield from _yield_from_tp_bucket()
                 num_experts = self.config.num_moe_experts
                 num_experts_per_rank = num_experts // self.mpu.ep_size
                 infer_params = [
@@ -657,28 +711,21 @@ class Bridge(ABC):
                     yield from zip(converted_names, [p.detach() for p in converted_params])
                 continue
 
-            # TP
+            # TP: add to bucket for batched gather
             if (
                 hasattr(broad_pp_param, "tensor_model_parallel")
                 and broad_pp_param.tensor_model_parallel
             ):
-                # allocate a new tensor with proper size
-                if self.mpu.tp_size <= 1:
-                    infer_params = [broad_pp_param]
-                else:
-                    infer_params = [
-                        torch.empty_like(broad_pp_param)
-                        for _ in range(self.mpu.tp_size)
-                    ]
-                    torch.distributed.all_gather(
-                        infer_params, broad_pp_param, group=self.mpu.tp_group
-                    )
-                infer_params = self._weight_merge_across_tp(
-                    name, infer_params, broad_pp_param
-                )
-            else:
-                infer_params = broad_pp_param
+                if tp_bucket and broad_pp_param.dtype != tp_bucket[0][1].dtype or param_bytes + tp_bucket_bytes[0] > tp_gather_bucket_size_bytes:
+                    yield from _yield_from_tp_bucket()
+                tp_bucket.append((name, broad_pp_param))
+                tp_bucket_bytes[0] += param_bytes
+                continue
 
+            # Non-TP param: flush pending TP bucket first
+            yield from _yield_from_tp_bucket()
+
+            infer_params = broad_pp_param
             converted_names, converted_params = self._weight_to_hf_format(
                 name, infer_params
             )
@@ -687,6 +734,8 @@ class Bridge(ABC):
                 continue
 
             yield from zip(converted_names, [p.detach() for p in converted_params])
+
+        yield from _yield_from_tp_bucket()
 
     def export_weights_without_gather(
         self, models: list[torch.nn.Module],
