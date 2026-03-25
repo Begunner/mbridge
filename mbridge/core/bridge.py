@@ -744,6 +744,8 @@ class Bridge(ABC):
 
         def _flush_tp_bucket():
             nonlocal tp_bucket, tp_bucket_bytes
+            if not tp_bucket or tp_bucket_bytes == 0:
+                return
             gathered_bucket = self._gather_export_bucket_to_rank0(
                 tp_bucket,
                 self.mpu.tp_group,
@@ -767,6 +769,8 @@ class Bridge(ABC):
 
         def _flush_ep_bucket():
             nonlocal ep_bucket, ep_bucket_bytes
+            if not ep_bucket or ep_bucket_bytes == 0:
+                return
             gathered_ep_bucket = self._gather_export_bucket_to_rank0(
                 ep_bucket,
                 self.mpu.ep_group,
