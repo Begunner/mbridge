@@ -117,7 +117,7 @@ class AutoBridge:
             "Use from_pretrained() or from_config() class methods instead."
         )
 
-    def export_weights(self, models: list) -> None:
+    def export_weights(self, models: list, export_on_all_ranks: bool = True) -> None:
         """
         This is a placeholder implementation. AutoBridge doesn't implement this method directly
         as it delegates to specific bridge classes.

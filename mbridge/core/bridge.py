@@ -64,7 +64,9 @@ class Bridge(ABC):
         # Some moe models require multiple weights to be combined into one,
         # such as qwen3vl. It will cache it into this buff until all weights are collected.
         self.export_weights_buff = {}
-        self.export_weights_buffer_max_size_bytes = 4 * 1024**3  # 4GB gather buffer
+        # 4GB max gather buffer size for export weights
+        # TODO: make this configurable
+        self.export_weights_buffer_max_size_bytes = 4 * 1024**3
 
     def get_model(
         self,
@@ -509,7 +511,7 @@ class Bridge(ABC):
             return self._save_weights_fast(models, weights_path, strict=strict)
 
         rank = torch.distributed.get_rank() if is_distributed else 0
-        per_tensor_generator = self.export_weights(models)
+        per_tensor_generator = self.export_weights(models, export_on_all_ranks=False)
 
         if rank != 0:
             for _, _ in per_tensor_generator:
@@ -1001,6 +1003,7 @@ class Bridge(ABC):
             )
 
             if is_ep_param:
+                # flush tp bucket first to keep logic simple, assuming ep params always appears together
                 yield from _flush_tp_bucket()
                 if _should_flush_bucket(
                     ep_bucket, ep_bucket_bytes, param, ep_bucket_limit_bytes
@@ -1030,7 +1033,7 @@ class Bridge(ABC):
             if not emit_outputs:
                 continue
             yield from self._iter_converted_export_outputs(name, param)
-
+        # last clean up
         yield from _flush_ep_bucket()
         yield from _flush_tp_bucket()
 
