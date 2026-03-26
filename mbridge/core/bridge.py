@@ -972,10 +972,12 @@ class Bridge(ABC):
 
         def _flush_ep_bucket():
             nonlocal ep_bucket, ep_bucket_bytes
+            if not ep_bucket:
+                return
             gathered_ep_bucket = collect_bucket_fn(ep_bucket, "ep")
             ep_bucket = []
             ep_bucket_bytes = 0
-            if gathered_ep_bucket is None:
+            if not gathered_ep_bucket:
                 return
 
             num_experts = self.config.num_moe_experts
