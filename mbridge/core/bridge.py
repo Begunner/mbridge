@@ -913,8 +913,6 @@ class Bridge(ABC):
         etp_bucket_limit_bytes = self._get_collective_bucket_size_bytes(
             self.mpu.etp_size
         )
-        num_experts = self.config.num_moe_experts
-        num_experts_per_rank = num_experts // self.mpu.ep_size
 
         def _tensor_num_bytes(tensor: torch.Tensor) -> int:
             return tensor.nelement() * tensor.element_size()
@@ -980,6 +978,8 @@ class Bridge(ABC):
             if gathered_ep_bucket is None:
                 return
 
+            num_experts = self.config.num_moe_experts
+            num_experts_per_rank = num_experts // self.mpu.ep_size
             etp_bucket: list[tuple[str, torch.Tensor]] = []
             for bname, _, ep_shards in gathered_ep_bucket:
                 name_prefix, local_expert_id = bname.split(".weight")
