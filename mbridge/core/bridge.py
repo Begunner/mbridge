@@ -14,12 +14,7 @@ from safetensors import safe_open
 
 from .parallel_states import ParallelStates
 from .safetensor_io import SafeTensorIO
-from .util import (
-    broadcast_from_megatron_pp,
-    broadcast_str_from_megatron_pp,
-    get_model,
-    unwrap_model,
-)
+from .util import get_model, unwrap_model
 
 
 class Bridge(ABC):
@@ -842,39 +837,74 @@ class Bridge(ABC):
                 _, param = None, None
             yield local_to_global_map[iter_name], param
 
+    def _build_local_export_param_manifest(
+        self, models: list[torch.nn.Module]
+    ) -> list[tuple[int, str, tuple[int, ...], str, bool | None, int | None]]:
+        manifest = []
+        for name, param in self._iter_local_stage_named_params(models):
+            manifest.append(
+                (
+                    self.mpu.pp_rank,
+                    name,
+                    tuple(param.shape),
+                    self._torch_dtype_name(param.dtype),
+                    getattr(param, "tensor_model_parallel", None),
+                    getattr(param, "partition_dim", None),
+                )
+            )
+        return manifest
+
     def _iter_all_ranks_named_params(
         self, models: list[torch.nn.Module], is_distributed: bool
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        local_weight_entries = self._build_export_weight_entries(
-            models, include_pp_rank=True
+        if not is_distributed:
+            yield from self._iter_local_stage_named_params(models)
+            return
+
+        local_param_manifest = self._build_local_export_param_manifest(models)
+        param_manifest_all_pp = [None] * self.mpu.pp_size
+        torch.distributed.all_gather_object(
+            object_list=param_manifest_all_pp,
+            obj=local_param_manifest,
+            group=self.mpu.pp_group,
         )
-        if is_distributed:
-            weight_entries_all_pp = [None] * self.mpu.pp_size
-            torch.distributed.all_gather_object(
-                object_list=weight_entries_all_pp,
-                obj=local_weight_entries,
+        param_manifest_all_pp = sum(param_manifest_all_pp, [])
+
+        local_named_params = self._iter_local_stage_named_params(models)
+        for (
+            iter_pp_rank,
+            name,
+            shape,
+            dtype_name,
+            tensor_parallel,
+            partition_dim,
+        ) in param_manifest_all_pp:
+            if iter_pp_rank == self.mpu.pp_rank:
+                local_name, tensor = next(local_named_params)
+                if local_name != name:
+                    raise RuntimeError(
+                        f"export parameter manifest mismatch: {local_name=} {name=}"
+                    )
+            else:
+                tensor = torch.empty(
+                    size=shape,
+                    dtype=self._torch_dtype_from_name(dtype_name),
+                    device=torch.cuda.current_device(),
+                )
+                if tensor_parallel is not None:
+                    tensor.tensor_model_parallel = tensor_parallel
+                if partition_dim is not None:
+                    tensor.partition_dim = partition_dim
+
+            src_global_rank = torch.distributed.get_global_rank(
+                group=self.mpu.pp_group, group_rank=iter_pp_rank
+            )
+            torch.distributed.broadcast(
+                tensor=tensor,
+                src=src_global_rank,
                 group=self.mpu.pp_group,
             )
-            weight_entries_all_pp = sum(weight_entries_all_pp, [])
-        else:
-            weight_entries_all_pp = local_weight_entries
-
-        model_chunk_generator = self._iter_model_chunks(models)
-        local_to_global_maps = self._get_export_local_to_global_maps(models)
-        for iter_pp_rank, iter_vpp_rank, iter_name in weight_entries_all_pp:
-            if iter_pp_rank == self.mpu.pp_rank:
-                try:
-                    _, param = next(model_chunk_generator)
-                except StopIteration:
-                    _, param = None, None
-                name = local_to_global_maps[iter_vpp_rank][iter_name]
-            else:
-                name, param = None, None
-
-            if is_distributed:
-                name = broadcast_str_from_megatron_pp(name)
-                param = broadcast_from_megatron_pp(param)
-            yield name, param
+            yield name, tensor
 
     def _iter_converted_export_outputs(
         self, name: str, tensor: torch.Tensor
