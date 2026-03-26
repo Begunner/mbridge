@@ -64,6 +64,7 @@ class Bridge(ABC):
         # Some moe models require multiple weights to be combined into one,
         # such as qwen3vl. It will cache it into this buff until all weights are collected.
         self.export_weights_buff = {}
+        self.export_weights_buffer_max_size_bytes = 4 * 1024**3  # 4GB gather buffer
 
     def get_model(
         self,
@@ -619,17 +620,12 @@ class Bridge(ABC):
             torch.distributed.recv(tensor=tensor, src=src_rank)
             yield hf_name, tensor
 
-    @staticmethod
     def _get_collective_bucket_size_bytes(
-        total_buffer_size_bytes: int, group_size: int
+        self, group_size: int
     ) -> int:
-        if total_buffer_size_bytes <= 0:
-            raise ValueError(
-                f"total_buffer_size_bytes must be positive, got {total_buffer_size_bytes}"
-            )
         if group_size <= 1:
-            return total_buffer_size_bytes
-        return max(total_buffer_size_bytes // group_size, 1)
+            return self.export_weights_buffer_max_size_bytes
+        return max(self.export_weights_buffer_max_size_bytes // group_size, 1)
 
     def _collect_export_bucket(
         self,
@@ -637,7 +633,6 @@ class Bridge(ABC):
         group: torch.distributed.ProcessGroup,
         group_rank: int,
         group_size: int,
-        total_buffer_size_bytes: int,
         gather_to_rank0: bool,
     ) -> list[tuple[str, torch.Tensor, list[torch.Tensor]]] | None:
         if not bucket:
@@ -653,9 +648,7 @@ class Bridge(ABC):
         if any(param.dtype != dtype for _, param in bucket):
             raise ValueError("bucket tensors must share the same dtype")
 
-        per_rank_bucket_size_bytes = self._get_collective_bucket_size_bytes(
-            total_buffer_size_bytes, group_size
-        )
+        per_rank_bucket_size_bytes = self._get_collective_bucket_size_bytes(group_size)
         max_chunk_numel = max(
             1, per_rank_bucket_size_bytes // bucket[0][1].element_size()
         )
@@ -751,14 +744,12 @@ class Bridge(ABC):
         group: torch.distributed.ProcessGroup,
         group_rank: int,
         group_size: int,
-        total_buffer_size_bytes: int,
     ) -> list[tuple[str, torch.Tensor, list[torch.Tensor]]] | None:
         return self._collect_export_bucket(
             bucket=bucket,
             group=group,
             group_rank=group_rank,
             group_size=group_size,
-            total_buffer_size_bytes=total_buffer_size_bytes,
             gather_to_rank0=True,
         )
 
@@ -768,14 +759,12 @@ class Bridge(ABC):
         group: torch.distributed.ProcessGroup,
         group_rank: int,
         group_size: int,
-        total_buffer_size_bytes: int,
     ) -> list[tuple[str, torch.Tensor, list[torch.Tensor]]] | None:
         return self._collect_export_bucket(
             bucket=bucket,
             group=group,
             group_rank=group_rank,
             group_size=group_size,
-            total_buffer_size_bytes=total_buffer_size_bytes,
             gather_to_rank0=False,
         )
 
@@ -907,7 +896,6 @@ class Bridge(ABC):
     def _iter_bucketed_export_outputs(
         self,
         named_params: Generator[tuple[str, torch.Tensor], None, None],
-        total_buffer_size_bytes: int,
         collect_bucket_fn: Callable[
             [list[tuple[str, torch.Tensor]], str],
             list[tuple[str, torch.Tensor, list[torch.Tensor]]] | None,
@@ -918,14 +906,10 @@ class Bridge(ABC):
         tp_bucket_bytes = 0
         ep_bucket: list[tuple[str, torch.Tensor]] = []
         ep_bucket_bytes = 0
-        tp_bucket_limit_bytes = self._get_collective_bucket_size_bytes(
-            total_buffer_size_bytes, self.mpu.tp_size
-        )
-        ep_bucket_limit_bytes = self._get_collective_bucket_size_bytes(
-            total_buffer_size_bytes, self.mpu.ep_size
-        )
+        tp_bucket_limit_bytes = self._get_collective_bucket_size_bytes(self.mpu.tp_size)
+        ep_bucket_limit_bytes = self._get_collective_bucket_size_bytes(self.mpu.ep_size)
         etp_bucket_limit_bytes = self._get_collective_bucket_size_bytes(
-            total_buffer_size_bytes, self.mpu.etp_size
+            self.mpu.etp_size
         )
         num_experts = self.config.num_moe_experts
         num_experts_per_rank = num_experts // self.mpu.ep_size
@@ -1053,7 +1037,6 @@ class Bridge(ABC):
     def _iter_rank0_export_weights(
         self,
         models: list[torch.nn.Module],
-        total_buffer_size_bytes: int,
         is_distributed: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         global_rank = torch.distributed.get_rank() if is_distributed else 0
@@ -1073,7 +1056,6 @@ class Bridge(ABC):
                     self.mpu.tp_group,
                     self.mpu.tp_rank,
                     self.mpu.tp_size,
-                    total_buffer_size_bytes,
                 )
             if parallel_mode == "ep":
                 return self._gather_export_bucket_to_rank0(
@@ -1081,7 +1063,6 @@ class Bridge(ABC):
                     self.mpu.ep_group,
                     self.mpu.ep_rank,
                     self.mpu.ep_size,
-                    total_buffer_size_bytes,
                 )
             if parallel_mode == "etp":
                 return self._gather_export_bucket_to_rank0(
@@ -1089,13 +1070,11 @@ class Bridge(ABC):
                     self.mpu.etp_group,
                     self.mpu.etp_rank,
                     self.mpu.etp_size,
-                    total_buffer_size_bytes,
                 )
             raise ValueError(f"Unsupported parallel_mode: {parallel_mode}")
 
         local_stage_outputs = self._iter_bucketed_export_outputs(
             self._iter_local_stage_named_params(models),
-            total_buffer_size_bytes,
             _collect_bucket,
             emit_outputs=is_selected_stage_sender,
         )
@@ -1126,7 +1105,6 @@ class Bridge(ABC):
     def _iter_all_ranks_export_weights(
         self,
         models: list[torch.nn.Module],
-        total_buffer_size_bytes: int,
         is_distributed: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         def _collect_bucket(bucket: list[tuple[str, torch.Tensor]], parallel_mode: str):
@@ -1136,7 +1114,6 @@ class Bridge(ABC):
                     self.mpu.tp_group,
                     self.mpu.tp_rank,
                     self.mpu.tp_size,
-                    total_buffer_size_bytes,
                 )
             if parallel_mode == "ep":
                 return self._all_gather_export_bucket(
@@ -1144,7 +1121,6 @@ class Bridge(ABC):
                     self.mpu.ep_group,
                     self.mpu.ep_rank,
                     self.mpu.ep_size,
-                    total_buffer_size_bytes,
                 )
             if parallel_mode == "etp":
                 return self._all_gather_export_bucket(
@@ -1152,13 +1128,11 @@ class Bridge(ABC):
                     self.mpu.etp_group,
                     self.mpu.etp_rank,
                     self.mpu.etp_size,
-                    total_buffer_size_bytes,
                 )
             raise ValueError(f"Unsupported parallel_mode: {parallel_mode}")
 
         yield from self._iter_bucketed_export_outputs(
             self._iter_all_ranks_named_params(models, is_distributed),
-            total_buffer_size_bytes,
             _collect_bucket,
             emit_outputs=True,
         )
@@ -1167,7 +1141,6 @@ class Bridge(ABC):
     def export_weights(
         self,
         models: list[torch.nn.Module],
-        total_buffer_size_bytes: int = 4 * 1024**3, # 4GB gather buffer
         export_on_all_ranks: bool = True,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         assert (
@@ -1179,14 +1152,9 @@ class Bridge(ABC):
         )
 
         if export_on_all_ranks:
-            yield from self._iter_all_ranks_export_weights(
-                models, total_buffer_size_bytes, is_distributed
-            )
-            return
-
-        yield from self._iter_rank0_export_weights(
-            models, total_buffer_size_bytes, is_distributed
-        )
+            yield from self._iter_all_ranks_export_weights(models, is_distributed)
+        else:
+            yield from self._iter_rank0_export_weights(models, is_distributed)
 
 
     def export_weights_without_gather(
