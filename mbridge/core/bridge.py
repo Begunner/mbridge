@@ -839,7 +839,7 @@ class Bridge(ABC):
 
     def _build_local_export_param_manifest(
         self, models: list[torch.nn.Module]
-    ) -> list[tuple[int, str, tuple[int, ...], str, bool | None, int | None]]:
+    ) -> list[tuple[int, str, tuple[int, ...], str, bool | None, int | None, int]]:
         manifest = []
         for name, param in self._iter_local_stage_named_params(models):
             manifest.append(
@@ -850,14 +850,103 @@ class Bridge(ABC):
                     self._torch_dtype_name(param.dtype),
                     getattr(param, "tensor_model_parallel", None),
                     getattr(param, "partition_dim", None),
+                    param.numel(),
                 )
             )
         return manifest
 
+    @staticmethod
+    def _tensor_num_bytes(tensor: torch.Tensor) -> int:
+        return tensor.nelement() * tensor.element_size()
+
+    @staticmethod
+    def _shape_numel(shape: tuple[int, ...]) -> int:
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        return numel
+
+    def _iter_pp_bucket_broadcast_outputs(
+        self,
+        bucket: list[
+            tuple[str, tuple[int, ...], str, bool | None, int | None, int, torch.Tensor | None]
+        ],
+        src_pp_rank: int,
+        bucket_size_bytes: int,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        if not bucket:
+            return
+
+        dtype = self._torch_dtype_from_name(bucket[0][2])
+        element_size = torch.empty((), dtype=dtype).element_size()
+        max_chunk_numel = max(1, bucket_size_bytes // element_size)
+        src_global_rank = torch.distributed.get_global_rank(
+            group=self.mpu.pp_group, group_rank=src_pp_rank
+        )
+
+        if self.mpu.pp_rank == src_pp_rank:
+            output_tensors = [tensor for _, _, _, _, _, _, tensor in bucket]
+            if any(tensor is None for tensor in output_tensors):
+                raise RuntimeError("source pp bucket is missing local tensors")
+            flat_views = [tensor.view(-1) for tensor in output_tensors]
+        else:
+            output_tensors = []
+            flat_views = []
+            for name, shape, _, tensor_parallel, partition_dim, _, _ in bucket:
+                tensor = torch.empty(
+                    size=shape,
+                    dtype=dtype,
+                    device=torch.cuda.current_device(),
+                )
+                if tensor_parallel is not None:
+                    tensor.tensor_model_parallel = tensor_parallel
+                if partition_dim is not None:
+                    tensor.partition_dim = partition_dim
+                output_tensors.append(tensor)
+                flat_views.append(tensor.view(-1))
+
+        buffer = torch.empty(max_chunk_numel, dtype=dtype, device=torch.cuda.current_device())
+        tensor_idx = 0
+        tensor_offset = 0
+        while tensor_idx < len(bucket):
+            chunk_segments = []
+            chunk_numel = 0
+            while tensor_idx < len(bucket) and chunk_numel < max_chunk_numel:
+                available = bucket[tensor_idx][5] - tensor_offset
+                take_numel = min(available, max_chunk_numel - chunk_numel)
+                if self.mpu.pp_rank == src_pp_rank:
+                    buffer[chunk_numel : chunk_numel + take_numel].copy_(
+                        flat_views[tensor_idx][tensor_offset : tensor_offset + take_numel]
+                    )
+                chunk_segments.append((tensor_idx, tensor_offset, chunk_numel, take_numel))
+                chunk_numel += take_numel
+                tensor_offset += take_numel
+                if tensor_offset == bucket[tensor_idx][5]:
+                    tensor_idx += 1
+                    tensor_offset = 0
+
+            chunk_view = buffer[:chunk_numel]
+            torch.distributed.broadcast(
+                tensor=chunk_view,
+                src=src_global_rank,
+                group=self.mpu.pp_group,
+            )
+
+            if self.mpu.pp_rank == src_pp_rank:
+                continue
+
+            for seg_tensor_idx, seg_tensor_offset, seg_chunk_offset, seg_numel in chunk_segments:
+                flat_views[seg_tensor_idx][
+                    seg_tensor_offset : seg_tensor_offset + seg_numel
+                ].copy_(chunk_view[seg_chunk_offset : seg_chunk_offset + seg_numel])
+
+        for (name, _, _, _, _, _, _), tensor in zip(bucket, output_tensors):
+            yield name, tensor
+
     def _iter_all_ranks_named_params(
         self, models: list[torch.nn.Module], is_distributed: bool
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        if not is_distributed:
+        if not is_distributed or self.mpu.pp_size <= 1:
             yield from self._iter_local_stage_named_params(models)
             return
 
@@ -868,43 +957,84 @@ class Bridge(ABC):
             obj=local_param_manifest,
             group=self.mpu.pp_group,
         )
-        param_manifest_all_pp = sum(param_manifest_all_pp, [])
-
         local_named_params = self._iter_local_stage_named_params(models)
-        for (
-            iter_pp_rank,
-            name,
-            shape,
-            dtype_name,
-            tensor_parallel,
-            partition_dim,
-        ) in param_manifest_all_pp:
-            if iter_pp_rank == self.mpu.pp_rank:
-                local_name, tensor = next(local_named_params)
-                if local_name != name:
-                    raise RuntimeError(
-                        f"export parameter manifest mismatch: {local_name=} {name=}"
-                    )
-            else:
-                tensor = torch.empty(
-                    size=shape,
-                    dtype=self._torch_dtype_from_name(dtype_name),
-                    device=torch.cuda.current_device(),
-                )
-                if tensor_parallel is not None:
-                    tensor.tensor_model_parallel = tensor_parallel
-                if partition_dim is not None:
-                    tensor.partition_dim = partition_dim
+        pp_bucket_limit_bytes = self.export_weights_buffer_max_size_bytes
+        element_size_cache: dict[str, int] = {}
+        for iter_pp_rank, stage_manifest in enumerate(param_manifest_all_pp):
+            pp_bucket: list[
+                tuple[
+                    str,
+                    tuple[int, ...],
+                    str,
+                    bool | None,
+                    int | None,
+                    int,
+                    torch.Tensor | None,
+                ]
+            ] = []
+            pp_bucket_bytes = 0
 
-            src_global_rank = torch.distributed.get_global_rank(
-                group=self.mpu.pp_group, group_rank=iter_pp_rank
-            )
-            torch.distributed.broadcast(
-                tensor=tensor,
-                src=src_global_rank,
-                group=self.mpu.pp_group,
-            )
-            yield name, tensor
+            def _flush_pp_bucket():
+                nonlocal pp_bucket, pp_bucket_bytes
+                yield from self._iter_pp_bucket_broadcast_outputs(
+                    pp_bucket,
+                    src_pp_rank=iter_pp_rank,
+                    bucket_size_bytes=pp_bucket_limit_bytes,
+                )
+                pp_bucket = []
+                pp_bucket_bytes = 0
+
+            for (
+                manifest_pp_rank,
+                name,
+                shape,
+                dtype_name,
+                tensor_parallel,
+                partition_dim,
+                numel,
+            ) in stage_manifest:
+                assert manifest_pp_rank == iter_pp_rank
+                if dtype_name not in element_size_cache:
+                    element_size_cache[dtype_name] = torch.empty(
+                        (), dtype=self._torch_dtype_from_name(dtype_name)
+                    ).element_size()
+                param_bytes = numel * element_size_cache[dtype_name]
+                if iter_pp_rank == self.mpu.pp_rank:
+                    local_name, tensor = next(local_named_params)
+                    if local_name != name:
+                        raise RuntimeError(
+                            f"export parameter manifest mismatch: {local_name=} {name=}"
+                        )
+                else:
+                    tensor = None
+
+                should_flush = (
+                    bool(pp_bucket)
+                    and (
+                        dtype_name != pp_bucket[0][2]
+                        or pp_bucket_bytes + param_bytes > pp_bucket_limit_bytes
+                    )
+                )
+                if should_flush:
+                    yield from _flush_pp_bucket()
+
+                pp_bucket.append(
+                    (
+                        name,
+                        shape,
+                        dtype_name,
+                        tensor_parallel,
+                        partition_dim,
+                        numel,
+                        tensor,
+                    )
+                )
+                pp_bucket_bytes += param_bytes
+
+                if pp_bucket_bytes >= pp_bucket_limit_bytes:
+                    yield from _flush_pp_bucket()
+
+            yield from _flush_pp_bucket()
 
     def _iter_converted_export_outputs(
         self, name: str, tensor: torch.Tensor
@@ -944,8 +1074,7 @@ class Bridge(ABC):
             self.mpu.etp_size
         )
 
-        def _tensor_num_bytes(tensor: torch.Tensor) -> int:
-            return tensor.nelement() * tensor.element_size()
+        _tensor_num_bytes = self._tensor_num_bytes
 
         def _should_flush_bucket(
             bucket: list[tuple[str, torch.Tensor]],
